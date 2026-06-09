@@ -99,7 +99,7 @@ def _article_snippet(article: Article) -> str:
 
 def _run_extraction(articles: list[Article], batch_id: str, source: str):
     agent = EntityEvalAgent()
-    source = {article.doc_id: (article.headline, article.content) for article in articles}
+    source_map = {article.doc_id: (article.headline, article.content) for article in articles}
 
     progress = st.progress(0)
     status = st.status("正在抽取...", expanded=True)
@@ -210,7 +210,7 @@ def _run_extraction(articles: list[Article], batch_id: str, source: str):
         state="complete" if not failures else "error",
         expanded=False,
     )
-    return entities_df, raw_lines, summary, source
+    return entities_df, raw_lines, summary, source_map
 
 
 @st.cache_data
