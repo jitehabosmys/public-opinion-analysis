@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,6 +9,12 @@ from dataclasses import dataclass
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+
+logger = logging.getLogger("public-opinion-web")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+)
 
 from entity_eval.agent import EntityEvalAgent
 from entity_eval.run import (
@@ -38,7 +45,7 @@ def _normalize_text(value) -> str:
 
 
 def _validate_articles(df: pd.DataFrame) -> tuple[list[Article], list[str]]:
-    required = {"doc_id", "headline", "content"}
+    required = {"headline", "content"}
     missing = sorted(required - set(df.columns))
     if missing:
         return [], [f"缺少必需列：{', '.join(missing)}"]
@@ -46,18 +53,19 @@ def _validate_articles(df: pd.DataFrame) -> tuple[list[Article], list[str]]:
     if len(df) > MAX_ARTICLES:
         return [], [f"最多支持 {MAX_ARTICLES} 篇，当前上传 {len(df)} 篇。"]
 
+    has_doc_id = "doc_id" in df.columns
     errors = []
     articles = []
     for idx, row in df.iterrows():
-        doc_id = _normalize_text(row["doc_id"])
+        doc_id = _normalize_text(row["doc_id"]) if has_doc_id else ""
         headline = _normalize_text(row["headline"])
         content = _normalize_text(row["content"])
-        if not doc_id:
-            errors.append(f"第 {idx + 1} 行 doc_id 为空。")
         if not content:
             errors.append(f"第 {idx + 1} 行 content 为空。")
-        if doc_id and content:
-            articles.append(Article(doc_id=doc_id, headline=headline, content=content))
+            continue
+        if not doc_id:
+            doc_id = str(uuid.uuid4())
+        articles.append(Article(doc_id=doc_id, headline=headline, content=content))
 
     return articles, errors
 
@@ -127,6 +135,13 @@ def _run_extraction(articles: list[Article]):
                             "error": record.error,
                         }
                     )
+                    logger.info(
+                        "OK doc_id=%s headline=%s entities=%d tokens=%d time=%.1fs",
+                        article.doc_id, _article_snippet(article),
+                        record.entities_count,
+                        record.prompt_tokens + record.completion_tokens,
+                        record.duration_seconds,
+                    )
                     for ent in entities:
                         rows.append(
                             {
@@ -142,6 +157,10 @@ def _run_extraction(articles: list[Article]):
                     st.write(f"[{done}/{total}] 完成：{_article_snippet(article)}")
                 except Exception as exc:
                     message = str(exc)
+                    logger.warning(
+                        "FAIL doc_id=%s headline=%s error=%s",
+                        article.doc_id, _article_snippet(article), message,
+                    )
                     failures.append(
                         {
                             "doc_id": article.doc_id,
@@ -271,6 +290,17 @@ def main():
     tab_upload, tab_manual = st.tabs(["CSV 上传", "手动输入"])
 
     with tab_upload:
+        st.info(
+            "**CSV 格式说明**  \n"
+            "必需列：`headline`（标题）、`content`（正文）  \n"
+            "可选列：`doc_id`（文章 ID，不填自动生成 UUID）  \n\n"
+            "示例：\n"
+            "```\n"
+            "headline,content\n"
+            "\"公司A获投资\",\"公司A今日宣布完成新一轮融资...\"\n"
+            "\"公司B发布财报\",\"公司B昨日公布2024年财报...\"\n"
+            "```"
+        )
         uploaded = st.file_uploader("上传 CSV 文件", type=["csv"])
         upload_articles: list[Article] = []
         upload_errors: list[str] = []
@@ -283,8 +313,9 @@ def main():
                         st.error(error)
                 else:
                     st.success(f"已读取 {len(upload_articles)} 篇文章。")
+                    preview_cols = [c for c in ["doc_id", "headline", "content"] if c in df.columns]
                     st.dataframe(
-                        df[["doc_id", "headline", "content"]].head(20),
+                        df[preview_cols].head(20),
                         use_container_width=True,
                         hide_index=True,
                     )
@@ -292,7 +323,9 @@ def main():
                 st.error(f"CSV 读取失败：{exc}")
 
         if st.button("开始抽取上传内容", disabled=not upload_articles):
+            logger.info("BATCH start source=upload articles=%d", len(upload_articles))
             st.session_state["upload_result"] = _run_extraction(upload_articles)
+            logger.info("BATCH end source=upload")
 
         _render_results("upload_result", "上传文件抽取结果")
 
@@ -307,7 +340,9 @@ def main():
         manual_articles = _manual_articles(int(count))
         st.caption(f"已填写 {len(manual_articles)} / {int(count)} 篇有效内容。")
         if st.button("开始抽取手动内容", disabled=not manual_articles):
+            logger.info("BATCH start source=manual articles=%d", len(manual_articles))
             st.session_state["manual_result"] = _run_extraction(manual_articles)
+            logger.info("BATCH end source=manual")
 
         _render_results("manual_result", "手动输入抽取结果")
 
