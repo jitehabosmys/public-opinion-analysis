@@ -1,0 +1,12 @@
+.agents/
+.codex/
+.git/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+eda_output/
+output/
+data/test_news_0603.csv

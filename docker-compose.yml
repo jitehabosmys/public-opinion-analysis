@@ -1,0 +1,14 @@
+services:
+  public-opinion-web:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        UV_INDEX_URL: ${UV_INDEX_URL:-}
+    image: public-opinion-analysis-web:latest
+    container_name: public-opinion-analysis-web
+    env_file:
+      - .env
+    ports:
+      - "8502:8501"
+    restart: unless-stopped
