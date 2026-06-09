@@ -10,6 +10,8 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+import database
+
 logger = logging.getLogger("public-opinion-web")
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +28,7 @@ from entity_eval.run import (
 )
 
 load_dotenv()
+database.init_db()
 
 MAX_ARTICLES = 100
 MAX_WORKERS = 4
@@ -94,7 +97,7 @@ def _article_snippet(article: Article) -> str:
     return title[:36] + ("..." if len(title) > 36 else "")
 
 
-def _run_extraction(articles: list[Article]):
+def _run_extraction(articles: list[Article], batch_id: str, source: str):
     agent = EntityEvalAgent()
     source = {article.doc_id: (article.headline, article.content) for article in articles}
 
@@ -199,6 +202,9 @@ def _run_extraction(articles: list[Article]):
         "filtered": filtered_rows,
     }
 
+    database.save_batch(batch_id, source, articles, records, failures)
+    database.save_entities(batch_id, merged_rows)
+
     status.update(
         label="抽取完成",
         state="complete" if not failures else "error",
@@ -287,7 +293,7 @@ def main():
         st.error("未检测到 LLM_API_KEY。请在 .env 中配置后再启动应用。")
         st.stop()
 
-    tab_upload, tab_manual = st.tabs(["CSV 上传", "手动输入"])
+    tab_upload, tab_manual, tab_history = st.tabs(["CSV 上传", "手动输入", "历史记录"])
 
     with tab_upload:
         st.info(
@@ -323,8 +329,9 @@ def main():
                 st.error(f"CSV 读取失败：{exc}")
 
         if st.button("开始抽取上传内容", disabled=not upload_articles):
+            batch_id = str(uuid.uuid4())
             logger.info("BATCH start source=upload articles=%d", len(upload_articles))
-            st.session_state["upload_result"] = _run_extraction(upload_articles)
+            st.session_state["upload_result"] = _run_extraction(upload_articles, batch_id, "upload")
             logger.info("BATCH end source=upload")
 
         _render_results("upload_result", "上传文件抽取结果")
@@ -340,11 +347,57 @@ def main():
         manual_articles = _manual_articles(int(count))
         st.caption(f"已填写 {len(manual_articles)} / {int(count)} 篇有效内容。")
         if st.button("开始抽取手动内容", disabled=not manual_articles):
+            batch_id = str(uuid.uuid4())
             logger.info("BATCH start source=manual articles=%d", len(manual_articles))
-            st.session_state["manual_result"] = _run_extraction(manual_articles)
+            st.session_state["manual_result"] = _run_extraction(manual_articles, batch_id, "manual")
             logger.info("BATCH end source=manual")
 
         _render_results("manual_result", "手动输入抽取结果")
+
+    with tab_history:
+        batches = database.list_batches(20)
+        if not batches:
+            st.info("暂无历史记录。")
+        else:
+            data = []
+            for b in batches:
+                data.append({
+                    "时间": b["created_at"][:19],
+                    "来源": b["source"],
+                    "文章": b["article_count"],
+                    "成功": b["success_count"],
+                    "实体数": b["total_entities"],
+                    "Token": b["total_tokens"],
+                })
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+
+            batch_ids = [b["id"] for b in batches]
+            selected = st.selectbox("查看详细记录", batch_ids, format_func=lambda x: x[:8] + "...")
+
+            if selected:
+                articles, entities = database.get_batch_detail(selected)
+                if not articles:
+                    st.info("无法获取详情。")
+                else:
+                    for a in articles:
+                        label = f"{a['headline'] or '(无标题)'} — {a['status']} ({a['entities_count']} 实体, {a['prompt_tokens'] + a['completion_tokens']} token, {a['duration_seconds']:.1f}s)"
+                        with st.expander(label):
+                            if a["status"] == "failed":
+                                st.error(f"失败原因：{a['error']}")
+                            article_entities = [e for e in entities if e["doc_id"] == a["doc_id"]]
+                            if article_entities:
+                                st.dataframe(
+                                    pd.DataFrame([{
+                                        "entity": e["entity"],
+                                        "mapped_from": e["mapped_from"],
+                                        "sentiment": e["entity_sentiment"],
+                                        "impact": e["impact_level"],
+                                        "reason": e["sentiment_reason"],
+                                        "risk_type": e["risk_type"],
+                                    } for e in article_entities]),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
 
 
 if __name__ == "__main__":

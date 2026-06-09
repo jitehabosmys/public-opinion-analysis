@@ -11,4 +11,6 @@ services:
       - .env
     ports:
       - "8502:8501"
+    volumes:
+      - ./db-data:/app/db-data
     restart: unless-stopped
