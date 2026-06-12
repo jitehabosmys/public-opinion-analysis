@@ -66,7 +66,7 @@ st.file_uploader(..., accept_multiple_files=True)
 
 ## 三、表格组件升级
 
-`st.dataframe` 替换为 `st.data_editor(disabled=True)`，视觉上基本一致，但每列顶部增加筛选输入框，可按值过滤行：
+`st.dataframe` 替换为 `st.data_editor(disabled=True)`，视觉上基本一致，支持排序和列宽调整（筛选需下载 XLSX 后操作）。
 
 | 位置 | 文件 | 行数 |
 |------|------|------|
