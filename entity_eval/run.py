@@ -66,7 +66,7 @@ def _dedupe_keep_order(values: list[str]) -> list[str]:
 
 
 def _split_mapped_from(value: str) -> list[str]:
-    if not value:
+    if not value or not isinstance(value, str):
         return []
     return [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
 

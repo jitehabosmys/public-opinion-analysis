@@ -59,11 +59,15 @@ REVIEWER_PROMPT = """你是一个金融舆情遗漏审查员。给定一篇新�
 
 ## 示例
 
-例1：ETF成分股不应输出
-标题：芯片ETF（159995）高开震荡，半导体板块走强
-正文：芯片ETF今日高开震荡，成分股圣邦股份涨超10%，龙芯中科涨6.91%。
-系统已抽取：[]
-输出：[]
+例1：投资方被遗漏
+标题：曦智科技登陆港交所，多家机构参与投资
+正文：全球首家光电混合算力企业曦智科技今日在港交所挂牌上市，上市首日股价大涨88%。公司本轮融资得到了真格基金、百度、五源资本等多家投资机构的支持，募资总额超过20亿港元。
+系统已抽取：
+[{"entity": "曦智科技", "entity_sentiment": "利好", "sentiment_reason": "全球首家光电混合算力企业登陆港交所，上市首日股价大涨88%"}]
+输出：
+[{"entity": "真格基金", "mapped_from": "", "entity_sentiment": "中性", "impact_level": "", "sentiment_reason": "作为曦智科技的投资方被提及，有具体投资事件", "risk_type": ""},
+ {"entity": "百度", "mapped_from": "", "entity_sentiment": "中性", "impact_level": "", "sentiment_reason": "作为曦智科技的投资方被提及，有具体投资事件", "risk_type": ""},
+ {"entity": "五源资本", "mapped_from": "", "entity_sentiment": "中性", "impact_level": "", "sentiment_reason": "作为曦智科技的投资方被提及，有具体投资事件", "risk_type": ""}]
 
 例2：纯股价涨跌不应输出
 标题：科技股全线大涨，恒生科技指数涨超4%

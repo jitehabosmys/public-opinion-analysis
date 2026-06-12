@@ -9,7 +9,8 @@ from openai import OpenAI
 
 load_dotenv()
 
-JUDGE_PROMPT = """你是一个金融舆情评测专家。检查系统提取的商业实体是否完整、是否有多余。
+JUDGE_PROMPT = """你是一个金融舆情评测专家。检查系统提取的商业实体是否完整、是否有多余，
+以及情感方向和风险分类是否准确。
 
 ## 任务边界
 - 同时检查遗漏（missed）和多余（extra）。
@@ -40,9 +41,33 @@ JUDGE_PROMPT = """你是一个金融舆情评测专家。检查系统提取的�
 - 常规治理事项：董事会决议、监事会决议、股东会通知、人事变更、
   投资者交流等公司例行事务，不构成"具体事件"。
 
+## 情感方向检查（针对系统已提取的每个实体）
+- 对照原文事件判断 entity_sentiment 是否准确。
+- 利好：业绩增长、收入提升、盈利改善、股价上涨、融资成功、合作签约、
+  产品发布、产能扩张、市场拓展、获得认证、政策受益等正面事件。
+- 利空：处罚、亏损、召回、诉讼、事故、裁员、关店、停产、违约、
+  减值、债务问题、监管问询、产品质量问题、负面舆情等负面事件。
+- 中性：有具体事件但正负方向不明确，或事件对实体影响不显著。
+- 注意区分"正负面不明确"和"完全没有事件"——后者应在 extra 中处理。
+
+## 风险类别检查（仅针对 entity_sentiment 为"利空"的实体）
+- 对照原文事件判断 risk_type 分类是否齐全、有无多余。
+- 产品质量：产品召回、事故、质量问题、食品安全、不合格
+- 财务风险：亏损、减值、债务违约、资金链断裂、业绩下滑
+- 监管合规：处罚、诉讼、监管问询、立案、整改通知
+- 经营风险：停产、裁员、关店、供应链中断、产能不足
+- 竞争风险：份额下滑、被竞品超越、客户流失
+- 品牌声誉：负面舆情、丑闻、公关危机
+- 同一事件涉及多个维度时应填写多个类别，缺少或多余都应指出。
+
 ## JSON 输出格式
-{"missed": [{"entity": "实体名称", "reason": "遗漏原因"}], "extra": [{"entity": "实体名称", "reason": "多余原因"}]}
-无 missed 或 extra 时对应列表为空 []。
+{
+  "missed": [{"entity": "实体名称", "reason": "遗漏原因"}],
+  "extra": [{"entity": "实体名称", "reason": "多余原因"}],
+  "sentiment_errors": [{"entity": "实体名称", "got": "当前方向", "expected": "正确方向", "reason": "判断依据"}],
+  "risk_type_errors": [{"entity": "实体名称", "got": "当前类别", "expected": ["正确类别列表"], "reason": "判断依据"}]
+}
+无对应问题时对应列表为空 []。
 
 ## 示例
 
@@ -54,28 +79,39 @@ JUDGE_PROMPT = """你是一个金融舆情评测专家。检查系统提取的�
 [{"entity": "曾毓群", "entity_sentiment": "中性", "sentiment_reason": "董事长被提及"},
  {"entity": "宁德时代", "entity_sentiment": "中性", "sentiment_reason": "与苹果洽谈电池供应"}]
 输出：
-{"missed": [], "extra": [{"entity": "曾毓群", "reason": "个人姓名，非商业实体"}]}
+{"missed": [], "extra": [{"entity": "曾毓群", "reason": "个人姓名，非商业实体"}],
+ "sentiment_errors": [], "risk_type_errors": []}
 
 例2：ETF成分股不应列为 missed
 标题：芯片ETF（159995）高开震荡，半导体板块走强
 正文：芯片ETF今日高开震荡，成分股圣邦股份涨超10%，龙芯中科涨6.91%。
 系统提取：[]
 输出：
-{"missed": [], "extra": []}
+{"missed": [], "extra": [], "sentiment_errors": [], "risk_type_errors": []}
 
 例3：纯股价涨跌不应列为 missed
 标题：科技股全线大涨，恒生科技指数涨超4%
 正文：今日港股科技股大涨，中国联通涨超11%，阿里巴巴涨超11%，哔哩哔哩涨超10%。
 系统提取：[]
 输出：
-{"missed": [], "extra": []}
+{"missed": [], "extra": [], "sentiment_errors": [], "risk_type_errors": []}
 
 例4：名单/对比对象不应列为 missed
 标题：高盛列出对冲基金共同偏爱的股票
 正文：高盛最新报告显示，对冲基金与共同基金偏爱的股票包括AppLovin、万事达、Spotify等。
 系统提取：[]
 输出：
-{"missed": [], "extra": []}"""  # noqa: E501
+{"missed": [], "extra": [], "sentiment_errors": [], "risk_type_errors": []}
+
+例5：情感方向+风险类别检查
+标题：特斯拉因刹车隐患召回超10万辆Model Y
+正文：国家市场监管总局公告，特斯拉因刹车系统隐患召回2023年至2025年生产的部分Model Y，共计10.2万辆。受此影响，特斯拉股价下跌5%。
+系统提取：
+[{"entity": "特斯拉", "entity_sentiment": "利好", "sentiment_reason": "召回10.2万辆Model Y", "risk_type": ""}]
+输出：
+{"missed": [], "extra": [],
+ "sentiment_errors": [{"entity": "特斯拉", "got": "利好", "expected": "利空", "reason": "召回是安全事件，应判利空"}],
+ "risk_type_errors": [{"entity": "特斯拉", "got": "", "expected": ["产品质量"], "reason": "刹车隐患召回属于产品质量问题"}]}"""  # noqa: E501
 
 
 @dataclass
@@ -83,10 +119,14 @@ class JudgeResult:
     doc_id: str
     missed: list[dict] = None
     extra: list[dict] = None
+    sentiment_errors: list[dict] = None
+    risk_type_errors: list[dict] = None
 
     def __post_init__(self):
         self.missed = self.missed or []
         self.extra = self.extra or []
+        self.sentiment_errors = self.sentiment_errors or []
+        self.risk_type_errors = self.risk_type_errors or []
 
 
 @dataclass
@@ -98,6 +138,8 @@ class JudgeCallRecord:
     completion_tokens: int
     entity_recall: float | None
     relevance_precision: float
+    sentiment_accuracy: float | None = None
+    risk_type_accuracy: float | None = None
     error: str = ""
 
 
@@ -105,12 +147,19 @@ DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
 DEFAULT_MODEL = "deepseek-v4-flash"
 
 
-def _compute_scores(missed: list[str], extra: list[str], extracted_count: int):
+def _compute_scores(missed: list[str], extra: list[str], extracted_count: int,
+                    sentiment_errors: list[dict] | None = None,
+                    risk_type_errors: list[dict] | None = None,
+                    risk_type_relevant: int = 0):
     keep = max(0, extracted_count - len(extra))
-    relevance_precision = round(keep / extracted_count, 3) if extracted_count > 0 else 1.0
     total_relevant = keep + len(missed)
-    entity_recall = round(keep / total_relevant, 3) if total_relevant > 0 else None
-    return entity_recall, relevance_precision
+
+    relevance_precision = round(keep / extracted_count, 3) if extracted_count > 0 else 1.0
+    entity_recall = round(keep / total_relevant, 3) if total_relevant > 0 else 1.0
+    sentiment_accuracy = round(1 - len(sentiment_errors or []) / extracted_count, 3) if extracted_count > 0 else None
+    risk_type_accuracy = round(1 - len(risk_type_errors or []) / risk_type_relevant, 3) if risk_type_relevant > 0 else None
+
+    return entity_recall, relevance_precision, sentiment_accuracy, risk_type_accuracy
 
 
 class JudgeAgent:
@@ -144,7 +193,7 @@ class JudgeAgent:
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            temperature=0.2,
+                    temperature=0.0,
             extra_body={"thinking": {"type": "disabled"}},
         )
         elapsed = time.monotonic() - t0
@@ -153,7 +202,13 @@ class JudgeAgent:
         usage = response.usage
 
         result = self._parse_response(doc_id, raw)
-        er, rp = _compute_scores(result.missed, result.extra, total_extracted)
+        risk_type_relevant = sum(1 for r in extracted_records if r.get("entity_sentiment") == "利空")
+        er, rp, sa, rta = _compute_scores(
+            result.missed, result.extra, total_extracted,
+            sentiment_errors=result.sentiment_errors,
+            risk_type_errors=result.risk_type_errors,
+            risk_type_relevant=risk_type_relevant,
+        )
 
         record = JudgeCallRecord(
             doc_id=doc_id,
@@ -163,6 +218,8 @@ class JudgeAgent:
             completion_tokens=getattr(usage, "completion_tokens", 0),
             entity_recall=er,
             relevance_precision=rp,
+            sentiment_accuracy=sa,
+            risk_type_accuracy=rta,
         )
         return result, record
 
@@ -181,15 +238,23 @@ class JudgeAgent:
                     result.append({"entity": item, "reason": ""})
             return result
 
-        missed = data.get("missed", [])
-        extra = data.get("extra", [])
-        if not isinstance(missed, list):
-            raise ValueError(f"missed field is not a list: {type(missed).__name__}\nraw: {raw}")
-        if not isinstance(extra, list):
-            raise ValueError(f"extra field is not a list: {type(extra).__name__}\nraw: {raw}")
+        def _validate_list(items, name: str) -> list:
+            if not isinstance(items, list):
+                raise ValueError(f"{name} field is not a list: {type(items).__name__}\nraw: {raw}")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"{name} item is not a dict: {type(item).__name__}\nraw: {raw}")
+            return items
+
+        missed = _validate_list(data.get("missed", []), "missed")
+        extra = _validate_list(data.get("extra", []), "extra")
+        sentiment_errors = _validate_list(data.get("sentiment_errors", []), "sentiment_errors")
+        risk_type_errors = _validate_list(data.get("risk_type_errors", []), "risk_type_errors")
 
         return JudgeResult(
             doc_id=doc_id,
             missed=_normalize(missed),
             extra=_normalize(extra),
+            sentiment_errors=sentiment_errors,
+            risk_type_errors=risk_type_errors,
         )

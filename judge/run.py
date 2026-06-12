@@ -127,7 +127,9 @@ def main(args):
         "entity",
         "mapped_from",
         "entity_sentiment",
+        "impact_level",
         "sentiment_reason",
+        "risk_type",
     ]
     if entities_df.empty:
         entity_records_by_doc = {}
@@ -179,37 +181,44 @@ def main(args):
                         "doc_id": doc_id,
                         "entity_recall": record.entity_recall,
                         "relevance_precision": record.relevance_precision,
+                        "sentiment_accuracy": record.sentiment_accuracy,
+                        "risk_type_accuracy": record.risk_type_accuracy,
                         "missed": result.missed,
                         "extra": result.extra,
+                        "sentiment_errors": result.sentiment_errors,
+                        "risk_type_errors": result.risk_type_errors,
                     })
                     er = record.entity_recall
-                    recall_str = f"recall={er:.3f}" if er is not None else "recall=off"
+                    rp = record.relevance_precision
+                    sa = record.sentiment_accuracy
+                    rta = record.risk_type_accuracy
+                    extra_metrics = ""
+                    if sa is not None:
+                        extra_metrics += f" senti={sa:.3f}"
+                    if rta is not None:
+                        extra_metrics += f" risk={rta:.3f}"
                     print(f"[{pass_label}] [{done:>3}/{total}] [{record.duration_seconds:5.1f}s] "
-                          f"{recall_str} "
-                          f"prec={record.relevance_precision:.2f} | {snippet}")
-                    if record.relevance_precision < 1 or (er is not None and er < 1):
-                        extra_names = [e.get("entity", "") for e in result.extra]
-                        missed_names = [m.get("entity", "") for m in result.missed]
+                          f"recall={er:.3f} prec={rp:.2f}{extra_metrics} | {snippet}")
+                    has_issues = (
+                        er < 1
+                        or rp < 1
+                        or (sa is not None and sa < 1)
+                        or (rta is not None and rta < 1)
+                    )
+                    if has_issues:
                         print(f"  [detail] doc_id={doc_id}")
-                        print(f"  [detail] extra={json.dumps(result.extra, ensure_ascii=False)}")
-                        print(f"  [detail] missed={json.dumps(result.missed, ensure_ascii=False)}")
                         for m in result.missed:
-                            ent = m.get("entity", "")
                             reason = _shorten(m.get("reason", ""), 100)
-                            print(f"  [detail] JUDGE MISSED | entity={ent} | judge_reason={reason}")
+                            print(f"  [detail] MISSED  entity={m['entity']} reason={reason}")
                         for e in result.extra:
-                            ent = e.get("entity", "")
                             reason = _shorten(e.get("reason", ""), 100)
-                            print(f"  [detail] JUDGE EXTRA  | entity={ent} | judge_reason={reason}")
-                        for item in entity_records_by_doc.get(doc_id, []):
-                            marker = "EXTRA" if item.get("entity") in extra_names else "KEEP "
-                            print(
-                                "  [detail] "
-                                f"{marker} | entity={item.get('entity', '')} "
-                                f"| mapped_from={item.get('mapped_from', '')} "
-                                f"| sentiment={item.get('entity_sentiment', '')} "
-                                f"| reason={_shorten(item.get('sentiment_reason', ''))}"
-                            )
+                            print(f"  [detail] EXTRA   entity={e['entity']} reason={reason}")
+                        for se in result.sentiment_errors:
+                            reason = _shorten(se.get("reason", ""), 100)
+                            print(f"  [detail] SENTI   entity={se['entity']} got={se['got']} expected={se['expected']} reason={reason}")
+                        for rte in result.risk_type_errors:
+                            reason = _shorten(rte.get("reason", ""), 100)
+                            print(f"  [detail] RISK    entity={rte['entity']} got={rte['got']} expected={rte['expected']} reason={reason}")
                 except Exception as e:
                     pass_records.append(JudgeFailureRecord(doc_id=doc_id, error=str(e)))
                     failed_ids.append(doc_id)
@@ -247,7 +256,9 @@ def main(args):
 
     successful = [r for r in records if r.success]
     rp_scores = [r.relevance_precision for r in successful]
-    er_scores = [r.entity_recall for r in successful if r.entity_recall is not None]
+    er_scores = [r.entity_recall for r in successful]
+    sa_scores = [r.sentiment_accuracy for r in successful if r.sentiment_accuracy is not None]
+    rta_scores = [r.risk_type_accuracy for r in successful if r.risk_type_accuracy is not None]
 
     summary = {
         "config": {
@@ -262,8 +273,10 @@ def main(args):
         "judged": len(successful),
         "failed": len(records) - len(successful),
         "retry_saved": retry_count,
-        "avg_entity_recall": round(sum(er_scores) / len(er_scores), 3) if er_scores else None,
-        "avg_relevance_precision": round(sum(rp_scores) / len(rp_scores), 3) if rp_scores else 0,
+        "avg_entity_recall": round(sum(er_scores) / len(er_scores), 3),
+        "avg_relevance_precision": round(sum(rp_scores) / len(rp_scores), 3),
+        "avg_sentiment_accuracy": round(sum(sa_scores) / len(sa_scores), 3) if sa_scores else None,
+        "avg_risk_type_accuracy": round(sum(rta_scores) / len(rta_scores), 3) if rta_scores else None,
         "per_call": [
             {
                 "doc_id": r.doc_id,
@@ -273,6 +286,8 @@ def main(args):
                 "completion_tokens": r.completion_tokens,
                 "entity_recall": r.entity_recall,
                 "relevance_precision": r.relevance_precision,
+                "sentiment_accuracy": r.sentiment_accuracy,
+                "risk_type_accuracy": r.risk_type_accuracy,
                 "error": getattr(r, "error", ""),
             }
             for r in records
@@ -285,9 +300,14 @@ def main(args):
     print(f"\n{'='*50}")
     print(f"Judged {summary['judged']}/{summary['total_articles']} articles "
           f"(retry saved {summary['retry_saved']}).")
-    er = summary["avg_entity_recall"]
-    print(f"Entity recall:          {er:.3f}" if er is not None else "Entity recall:          disabled")
+    print(f"Entity recall:          {summary['avg_entity_recall']:.3f}")
     print(f"Relevance precision:    {summary['avg_relevance_precision']:.3f}")
+    sa = summary["avg_sentiment_accuracy"]
+    if sa is not None:
+        print(f"Sentiment accuracy:     {sa:.3f}")
+    rta = summary["avg_risk_type_accuracy"]
+    if rta is not None:
+        print(f"Risk type accuracy:     {rta:.3f}")
     print(f"Output formats: {', '.join(summary['config']['output_formats'])}")
     print(f"Wall clock: {wall_clock:.1f}s")
     print(f"Output: {args.output}/")

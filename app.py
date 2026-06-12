@@ -23,12 +23,10 @@ from entity_eval.agent import EntityEvalAgent
 from entity_eval.run import (
     ENTITY_COLUMNS,
     _build_raw_lines,
-    _dedup_reviewer_entities,
     _filter_entity_rows,
     _merge_entity_rows,
     _write_xlsx,
 )
-from reviewer.agent import ReviewerAgent
 
 load_dotenv()
 database.init_db()
@@ -100,8 +98,7 @@ def _article_snippet(article: Article) -> str:
     return title[:36] + ("..." if len(title) > 36 else "")
 
 
-def _run_extraction(articles: list[Article], batch_id: str, source: str,
-                    reviewer_mode: str = ""):
+def _run_extraction(articles: list[Article], batch_id: str, source: str):
     agent = EntityEvalAgent()
     source_map = {article.doc_id: (article.headline, article.content) for article in articles}
 
@@ -192,77 +189,6 @@ def _run_extraction(articles: list[Article], batch_id: str, source: str,
     kept_rows, filtered_rows = _filter_entity_rows(rows)
     merged_rows = _merge_entity_rows(kept_rows)
 
-    reviewer_recovered = 0
-    if reviewer_mode:
-        status.update(label="正在遗漏审查...", expanded=True)
-        reviewer_agent = ReviewerAgent()
-        existing_by_doc = {}
-        for r in rows:
-            existing_by_doc.setdefault(r["doc_id"], []).append({
-                "entity": r["entity"],
-                "mapped_from": r.get("mapped_from", ""),
-                "entity_sentiment": r.get("entity_sentiment", ""),
-                "sentiment_reason": r.get("sentiment_reason", ""),
-            })
-
-        if reviewer_mode == "zero":
-            zero_doc_ids = {r["doc_id"] for r in records if r["success"] and r["entities_count"] == 0}
-            review_articles = [a for a in articles if a.doc_id in zero_doc_ids]
-        else:
-            review_articles = articles
-
-        reviewer_rows: list[dict] = []
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(articles))) as pool:
-            meta = {}
-            for article in review_articles:
-                existing = existing_by_doc.get(article.doc_id, [])
-                future = pool.submit(
-                    reviewer_agent.review, article.doc_id,
-                    article.headline, article.content, existing,
-                )
-                meta[future] = article
-
-            review_done = 0
-            review_total = len(review_articles)
-            st.write(f"--- 遗漏审查阶段（{reviewer_mode} 模式） ---")
-            for future in as_completed(meta):
-                article = meta[future]
-                review_done += 1
-                try:
-                    entities, record = future.result()
-                    records.append({
-                        "doc_id": record.doc_id,
-                        "success": record.success,
-                        "duration_seconds": record.duration_seconds,
-                        "prompt_tokens": record.prompt_tokens,
-                        "completion_tokens": record.completion_tokens,
-                        "entities_count": record.entities_count,
-                        "error": record.error,
-                    })
-                    for ent in entities:
-                        reviewer_rows.append({
-                            "doc_id": article.doc_id,
-                            "entity": ent.entity,
-                            "mapped_from": ent.mapped_from,
-                            "entity_sentiment": ent.entity_sentiment,
-                            "impact_level": ent.impact_level,
-                            "sentiment_reason": ent.sentiment_reason,
-                            "risk_type": "，".join(ent.risk_type),
-                        })
-                    if record.entities_count > 0:
-                        st.write(f"[review {review_done}/{review_total}] 发现 {record.entities_count} 个遗漏")
-                except Exception as exc:
-                    logger.warning("REVIEW FAIL doc_id=%s error=%s", article.doc_id, exc)
-                    st.write(f"[review {review_done}/{review_total}] 失败：{_article_snippet(article)}")
-
-        reviewer_rows, review_filtered = _filter_entity_rows(reviewer_rows)
-        rows_before = len(merged_rows)
-        merged_rows = _dedup_reviewer_entities(merged_rows, reviewer_rows)
-        reviewer_recovered = len(merged_rows) - rows_before
-        if reviewer_recovered:
-            logger.info("Reviewer recovered %d entities", reviewer_recovered)
-            st.write(f"遗漏审查补充了 {reviewer_recovered} 个实体（{len(review_filtered)} 个被后处理过滤）")
-
     entities_df = pd.DataFrame(merged_rows, columns=ENTITY_COLUMNS)
     raw_lines = _build_raw_lines([article.doc_id for article in articles], merged_rows)
 
@@ -273,20 +199,16 @@ def _run_extraction(articles: list[Article], batch_id: str, source: str,
         "total_entities_before_filter": len(rows),
         "post_filtered_entities": len(filtered_rows),
         "total_entities": len(merged_rows),
-        "reviewer_recovered": reviewer_recovered,
         "records": records,
         "failures": failures,
-        "filtered": filtered_rows + (review_filtered if reviewer_mode else []),
+        "filtered": filtered_rows,
     }
 
     database.save_batch(batch_id, source, articles, records, failures)
     database.save_entities(batch_id, merged_rows)
 
-    label = "抽取完成"
-    if reviewer_recovered:
-        label += f"（补充 {reviewer_recovered} 实体）"
     status.update(
-        label=label,
+        label="抽取完成",
         state="complete" if not failures else "error",
         expanded=False,
     )
@@ -373,12 +295,6 @@ def main():
         st.error("未检测到 LLM_API_KEY。请在 .env 中配置后再启动应用。")
         st.stop()
 
-    reviewer_mode = st.selectbox(
-        "遗漏审查模式", ["", "all", "zero"],
-        format_func=lambda x: {"": "不启用", "all": "全部文章（~2x 耗时）", "zero": "仅 0 实体文章（~1.3x 耗时）"}[x],
-        help="在首次抽取后，由 AI 审查遗漏的商业实体并补充。all 覆盖更全，zero 性价比更高。",
-    )
-
     tab_upload, tab_manual, tab_history = st.tabs(["CSV 上传", "手动输入", "历史记录"])
 
     with tab_upload:
@@ -421,7 +337,7 @@ def main():
         if st.button("开始抽取上传内容", disabled=not upload_articles):
             batch_id = str(uuid.uuid4())
             logger.info("BATCH start source=upload articles=%d", len(upload_articles))
-            st.session_state["upload_result"] = _run_extraction(upload_articles, batch_id, "upload", reviewer_mode)
+            st.session_state["upload_result"] = _run_extraction(upload_articles, batch_id, "upload")
             logger.info("BATCH end source=upload")
 
         _render_results("upload_result", "上传文件抽取结果")
@@ -439,7 +355,7 @@ def main():
         if st.button("开始抽取手动内容", disabled=not manual_articles):
             batch_id = str(uuid.uuid4())
             logger.info("BATCH start source=manual articles=%d", len(manual_articles))
-            st.session_state["manual_result"] = _run_extraction(manual_articles, batch_id, "manual", reviewer_mode)
+            st.session_state["manual_result"] = _run_extraction(manual_articles, batch_id, "manual")
             logger.info("BATCH end source=manual")
 
         _render_results("manual_result", "手动输入抽取结果")
