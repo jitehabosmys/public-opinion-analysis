@@ -57,20 +57,19 @@ SYSTEM_PROMPT = """你是一个金融舆情分析师。分析新闻文章，提�
 同一事件涉及多个维度时填写多个。
 
 ## 示例
-标题：2026年中国人形机器人产业报告发布，头部厂商加速量产
-正文：IDC报告预测2026年中国人形机器人市场产量同比增长94%。特斯拉Optimus、
-小米铁大、智元等头部厂商均加快了研发和量产进程，美的集团也在加速布局。
+标题：特斯拉因刹车隐患召回超10万辆Model Y，比亚迪迎来新机遇
+正文：国家市场监管总局公告，特斯拉因刹车系统隐患召回2023年至2025年生产的部分Model Y，
+共计10.2万辆。受此影响，特斯拉股价下跌5%。而比亚迪同日宣布旗舰车型订单突破50万辆。
 输出：
 [
-  {"entity": "特斯拉", "mapped_from": "Optimus", "entity_sentiment": "利好",
+  {"entity": "特斯拉", "mapped_from": "Model Y", "entity_sentiment": "利空",
    "impact_level": "中",
-   "sentiment_reason": "IDC报告预测行业增长94%，特斯拉Optimus量产进程加快"},
-  {"entity": "小米集团", "mapped_from": "铁大", "entity_sentiment": "利好",
-   "impact_level": "中",
-   "sentiment_reason": "小米铁大研发和量产进程加快，受益于行业增长"},
-  {"entity": "美的集团", "mapped_from": "", "entity_sentiment": "利好",
-   "impact_level": "小",
-   "sentiment_reason": "公司加速布局人形机器人领域，但无具体产品或量产数据"}
+   "sentiment_reason": "因刹车隐患召回10.2万辆Model Y，股价下跌5%",
+   "risk_type": "产品质量"},
+  {"entity": "比亚迪", "mapped_from": "", "entity_sentiment": "利好",
+   "impact_level": "",
+   "sentiment_reason": "旗舰车型订单突破50万辆，反映市场竞争力增强",
+   "risk_type": ""}
 ]
 
 ## 映射示例
