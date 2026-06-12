@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from entity_eval.agent import EntityEvalAgent, SYSTEM_PROMPT_RELAXED
+from reviewer.agent import ReviewerAgent
 
 
 @dataclass
@@ -129,6 +130,17 @@ def _filter_entity_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
             kept.append(row)
 
     return kept, filtered
+
+
+def _dedup_reviewer_entities(existing: list[dict], reviewer: list[dict]) -> list[dict]:
+    seen = {(r["doc_id"], r["entity"]) for r in existing}
+    result = list(existing)
+    for r in reviewer:
+        key = (r["doc_id"], r["entity"])
+        if key not in seen:
+            seen.add(key)
+            result.append(r)
+    return result
 
 
 def _build_raw_lines(doc_ids: list[str], entity_rows: list[dict]) -> list[dict]:
@@ -267,6 +279,10 @@ def parse_args():
                              help="rerun 0-entity articles with relaxed prompt for recall diagnosis")
     rerun_group.add_argument("--retry-empty", action="store_true",
                              help="rerun 0-entity articles with formal prompt and merge results back")
+    parser.add_argument("--review", nargs="?", const="all", default=None,
+                        choices=["all", "zero"],
+                        help="run reviewer stage: 'all' (default) reviews every article, "
+                             "'zero' only reviews articles with 0 extracted entities")
     return parser.parse_args()
 
 
@@ -391,6 +407,78 @@ def main(args):
         wall_clock = time.time() - t_start
         print(f"  Recovered {retry_empty_recovered} entities from {retry_empty_articles} articles")
 
+    reviewer_recovered = 0
+    reviewer_recovered_articles = set()
+    n_before_review = len(all_entities)
+    if args.review:
+        zero_entity_ids = [
+            r.doc_id for r in records
+            if r.success and getattr(r, "entities_count", 0) == 0
+        ]
+        if args.review == "zero":
+            review_doc_ids = zero_entity_ids
+            scope_desc = f"{len(review_doc_ids)} 0-entity articles"
+        else:
+            review_doc_ids = list(source.keys())
+            scope_desc = f"{len(review_doc_ids)} articles"
+        print(f"\n--- Review stage ({args.review}): scanning {scope_desc} ---")
+        reviewer_agent = ReviewerAgent(model=args.model, base_url=args.base_url)
+        existing_by_doc = {}
+        for ent in all_entities:
+            existing_by_doc.setdefault(ent["doc_id"], []).append({
+                "entity": ent["entity"],
+                "mapped_from": ent.get("mapped_from", ""),
+                "entity_sentiment": ent.get("entity_sentiment", ""),
+                "sentiment_reason": ent.get("sentiment_reason", ""),
+            })
+
+        reviewer_entities: list[dict] = []
+        with ThreadPoolExecutor(max_workers=min(4, args.workers)) as pool:
+            meta = {}
+            for doc_id in review_doc_ids:
+                existing = existing_by_doc.get(doc_id, [])
+                headline, content = source[doc_id]
+                future = pool.submit(reviewer_agent.review, doc_id, headline, content, existing)
+                meta[future] = doc_id
+
+            done_count = 0
+            total = len(meta)
+            reviewer_records: list = []
+            for future in as_completed(meta):
+                doc_id = meta[future]
+                done_count += 1
+                snippet = source[doc_id][0][:50] + ("..." if len(source[doc_id][0]) > 50 else "")
+                try:
+                    entities, record = future.result()
+                    reviewer_records.append(record)
+                    for ent in entities:
+                        reviewer_entities.append({
+                            "doc_id": doc_id,
+                            "entity": ent.entity,
+                            "mapped_from": ent.mapped_from,
+                            "entity_sentiment": ent.entity_sentiment,
+                            "impact_level": ent.impact_level,
+                            "sentiment_reason": ent.sentiment_reason,
+                            "risk_type": "，".join(ent.risk_type),
+                        })
+                    if record.entities_count > 0:
+                        names = [e.entity for e in entities]
+                        print(f"  [review] [{done_count:>3}/{total}] found {record.entities_count}: {names}")
+                    else:
+                        print(f"  [review] [{done_count:>3}/{total}] none | {snippet}")
+                except Exception as e:
+                    print(f"  [review] [{done_count:>3}/{total}] err: {e} | {snippet}")
+
+        reviewer_entities, review_filtered = _filter_entity_rows(reviewer_entities)
+        all_entities = _dedup_reviewer_entities(all_entities, reviewer_entities)
+        reviewer_recovered = len(all_entities) - n_before_review
+        reviewer_recovered_articles = {r["doc_id"] for r in all_entities[n_before_review:]}
+        print(f"  Reviewer recovered {reviewer_recovered} entities "
+              f"({len(reviewer_recovered_articles)} articles), "
+              f"{len(review_filtered)} filtered by post-processing")
+        records.extend(reviewer_records)
+        wall_clock = time.time() - t_start
+
     raw_lines = _build_raw_lines(list(source.keys()), all_entities)
     entities_df = pd.DataFrame(all_entities, columns=ENTITY_COLUMNS)
 
@@ -455,6 +543,8 @@ def main(args):
         ],
         "retry_empty_articles": retry_empty_articles,
         "retry_empty_recovered": retry_empty_recovered,
+        "reviewer_recovered": reviewer_recovered,
+        "reviewer_recovered_articles": len(reviewer_recovered_articles),
         "total_entities_before_merge": total_entities_before_merge,
         "total_entities": len(all_entities),
         "per_call": [
@@ -481,6 +571,8 @@ def main(args):
     print(f"Entities extracted: {summary['total_entities']}")
     if args.retry_empty and retry_empty_recovered:
         print(f"Retry-empty recovered {retry_empty_recovered} entities from {retry_empty_articles} articles")
+    if args.review and reviewer_recovered:
+        print(f"Reviewer ({args.review}) recovered {reviewer_recovered} entities from {len(reviewer_recovered_articles)} articles")
     print(f"Output formats: {', '.join(summary['config']['output_formats'])}")
     print(f"Output: {args.output}/")
 
