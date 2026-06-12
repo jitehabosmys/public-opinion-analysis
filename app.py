@@ -5,6 +5,7 @@ import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -242,16 +243,16 @@ def _render_results(result_key: str, title: str):
 
     if summary["failures"]:
         with st.expander("失败文章", expanded=True):
-            st.dataframe(pd.DataFrame(summary["failures"]), use_container_width=True)
+            st.data_editor(pd.DataFrame(summary["failures"]), use_container_width=True, disabled=True)
 
     if summary["filtered"]:
         with st.expander("后处理过滤记录"):
-            st.dataframe(pd.DataFrame(summary["filtered"]), use_container_width=True)
+            st.data_editor(pd.DataFrame(summary["filtered"]), use_container_width=True, disabled=True)
 
     if entities_df.empty:
         st.info("没有抽取到有效商业实体。")
     else:
-        st.dataframe(entities_df, use_container_width=True, hide_index=True)
+        st.data_editor(entities_df, use_container_width=True, hide_index=True, disabled=True)
 
     doc_ids = list(source.keys())
     csv_bytes = entities_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -307,26 +308,30 @@ def main():
             "\"公司B发布财报\",\"公司B昨日公布2024年财报...\"\n"
             "```"
         )
-        uploaded = st.file_uploader("上传 CSV 文件", type=["csv"])
+        uploaded_files = st.file_uploader("上传 CSV 文件（支持多个，总行数 ≤100）", type=["csv"], accept_multiple_files=True)
         upload_articles: list[Article] = []
         upload_errors: list[str] = []
-        if uploaded is not None:
-            try:
-                df = pd.read_csv(uploaded)
+        if uploaded_files:
+            dfs = []
+            for f in uploaded_files:
+                try:
+                    dfs.append(pd.read_csv(f))
+                except Exception as exc:
+                    st.error(f"文件 {f.name} 读取失败：{exc}")
+            if dfs:
+                df = pd.concat(dfs, ignore_index=True)
                 upload_articles, upload_errors = _validate_articles(df)
                 if upload_errors:
                     for error in upload_errors:
                         st.error(error)
                 else:
-                    st.success(f"已读取 {len(upload_articles)} 篇文章。")
+                    st.success(f"已读取 {len(upload_articles)} 篇文章（来自 {len(uploaded_files)} 个文件）。")
                     preview_cols = [c for c in ["doc_id", "headline", "content"] if c in df.columns]
                     st.dataframe(
                         df[preview_cols].head(20),
                         use_container_width=True,
                         hide_index=True,
                     )
-            except Exception as exc:
-                st.error(f"CSV 读取失败：{exc}")
 
         if st.button("开始抽取上传内容", disabled=not upload_articles):
             batch_id = str(uuid.uuid4())
@@ -355,7 +360,34 @@ def main():
         _render_results("manual_result", "手动输入抽取结果")
 
     with tab_history:
-        batches = database.list_batches(20)
+        preset = st.radio(
+            "时间范围",
+            ["近24小时", "近7天", "近30天", "全部", "自定义"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        since = None
+        until = None
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if preset == "近24小时":
+            since = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        elif preset == "近7天":
+            since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        elif preset == "近30天":
+            since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        elif preset == "自定义":
+            date_col1, date_col2 = st.columns(2)
+            with date_col1:
+                d_from = st.date_input("从")
+            with date_col2:
+                d_to = st.date_input("至")
+            if d_from:
+                since = str(d_from)
+            if d_to:
+                until = str(d_to) + " 23:59:59"
+
+        batches = database.list_batches(since=since, until=until, limit=100)
         if not batches:
             st.info("暂无历史记录。")
         else:
@@ -369,10 +401,11 @@ def main():
                     "实体数": b["total_entities"],
                     "Token": b["total_tokens"],
                 })
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+            st.data_editor(pd.DataFrame(data), use_container_width=True, hide_index=True, disabled=True)
 
-            batch_ids = [b["id"] for b in batches]
-            selected = st.selectbox("查看详细记录", batch_ids, format_func=lambda x: x[:8] + "...")
+            batch_options = {f"{b['created_at'][:19]} ｜ {b['source']} ｜ {b['article_count']}篇 ｜ {b['total_entities']}实体": b["id"] for b in batches}
+            selected_label = st.selectbox("查看详细记录", list(batch_options.keys()))
+            selected = batch_options.get(selected_label)
 
             if selected:
                 articles, entities = database.get_batch_detail(selected)
@@ -386,7 +419,7 @@ def main():
                                 st.error(f"失败原因：{a['error']}")
                             article_entities = [e for e in entities if e["doc_id"] == a["doc_id"]]
                             if article_entities:
-                                st.dataframe(
+                                st.data_editor(
                                     pd.DataFrame([{
                                         "entity": e["entity"],
                                         "mapped_from": e["mapped_from"],
@@ -397,6 +430,7 @@ def main():
                                     } for e in article_entities]),
                                     use_container_width=True,
                                     hide_index=True,
+                                    disabled=True,
                                 )
 
 

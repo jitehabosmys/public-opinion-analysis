@@ -131,10 +131,20 @@ def save_entities(batch_id: str, entities_data: list):
     conn.close()
 
 
-def list_batches(limit: int = 20) -> list[sqlite3.Row]:
+def list_batches(since: str | None = None, until: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
     conn = get_conn()
+    conditions = []
+    params = []
+    if since:
+        conditions.append("created_at >= ?")
+        params.append(since)
+    if until:
+        conditions.append("created_at <= ?")
+        params.append(until)
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
     rows = conn.execute(
-        "SELECT * FROM batches ORDER BY created_at DESC LIMIT ?", (limit,)
+        f"SELECT * FROM batches {where} ORDER BY created_at DESC LIMIT ?",
+        params + [limit],
     ).fetchall()
     conn.close()
     return rows
