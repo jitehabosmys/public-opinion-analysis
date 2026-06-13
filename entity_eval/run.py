@@ -284,9 +284,10 @@ def parse_args():
                         choices=["all", "zero"],
                         help="run reviewer stage: 'all' (default) reviews every article, "
                              "'zero' only reviews articles with 0 extracted entities")
-    parser.add_argument("--infill", action="store_true",
-                        help="run infill stage: reviewer detects missed entity names, "
-                             "then infiller fills entity fields from the article")
+    parser.add_argument("--infill", nargs="?", const="zero", default=None,
+                        choices=["all", "zero"],
+                        help="run infill stage: 'all' reviews every article, "
+                             "'zero' (default) only reviews articles with 0 extracted entities")
     return parser.parse_args()
 
 
@@ -416,8 +417,14 @@ def main(args):
     n_before_review = len(all_entities)
     if args.review or args.infill:
         review_doc_ids = list(source.keys())
+        mode_label = args.infill if args.infill else args.review
+        if mode_label == "zero":
+            zero_entity_ids = {
+                r.doc_id for r in records
+                if r.success and getattr(r, "entities_count", 0) == 0
+            }
+            review_doc_ids = [d for d in review_doc_ids if d in zero_entity_ids]
         scope_desc = f"{len(review_doc_ids)} articles"
-        mode_label = "infill" if args.infill else args.review
         print(f"\n--- Review stage ({mode_label}): scanning {scope_desc} ---")
         reviewer_agent = ReviewerAgent(model=args.model, base_url=args.base_url)
         existing_by_doc = {}
@@ -619,7 +626,7 @@ def main(args):
     if args.retry_empty and retry_empty_recovered:
         print(f"Retry-empty recovered {retry_empty_recovered} entities from {retry_empty_articles} articles")
     if (args.review or args.infill) and reviewer_recovered:
-        mode = "Infill" if args.infill else f"Reviewer ({args.review})"
+        mode = f"Infill ({args.infill})" if args.infill else f"Reviewer ({args.review})"
         print(f"{mode} recovered {reviewer_recovered} entities from {len(reviewer_recovered_articles)} articles")
     print(f"Output formats: {', '.join(summary['config']['output_formats'])}")
     print(f"Output: {args.output}/")
