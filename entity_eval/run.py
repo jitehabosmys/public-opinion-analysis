@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from entity_eval.agent import EntityEvalAgent, SYSTEM_PROMPT_RELAXED
+from infiller.agent import InfillerAgent
 from reviewer.agent import ReviewerAgent
 
 
@@ -283,6 +284,9 @@ def parse_args():
                         choices=["all", "zero"],
                         help="run reviewer stage: 'all' (default) reviews every article, "
                              "'zero' only reviews articles with 0 extracted entities")
+    parser.add_argument("--infill", action="store_true",
+                        help="run infill stage: reviewer detects missed entity names, "
+                             "then infiller fills entity fields from the article")
     return parser.parse_args()
 
 
@@ -410,18 +414,11 @@ def main(args):
     reviewer_recovered = 0
     reviewer_recovered_articles = set()
     n_before_review = len(all_entities)
-    if args.review:
-        zero_entity_ids = [
-            r.doc_id for r in records
-            if r.success and getattr(r, "entities_count", 0) == 0
-        ]
-        if args.review == "zero":
-            review_doc_ids = zero_entity_ids
-            scope_desc = f"{len(review_doc_ids)} 0-entity articles"
-        else:
-            review_doc_ids = list(source.keys())
-            scope_desc = f"{len(review_doc_ids)} articles"
-        print(f"\n--- Review stage ({args.review}): scanning {scope_desc} ---")
+    if args.review or args.infill:
+        review_doc_ids = list(source.keys())
+        scope_desc = f"{len(review_doc_ids)} articles"
+        mode_label = "infill" if args.infill else args.review
+        print(f"\n--- Review stage ({mode_label}): scanning {scope_desc} ---")
         reviewer_agent = ReviewerAgent(model=args.model, base_url=args.base_url)
         existing_by_doc = {}
         for ent in all_entities:
@@ -432,7 +429,7 @@ def main(args):
                 "sentiment_reason": ent.get("sentiment_reason", ""),
             })
 
-        reviewer_entities: list[dict] = []
+        missed_entities: list[dict] = []
         with ThreadPoolExecutor(max_workers=min(4, args.workers)) as pool:
             meta = {}
             for doc_id in review_doc_ids:
@@ -449,34 +446,84 @@ def main(args):
                 done_count += 1
                 snippet = source[doc_id][0][:50] + ("..." if len(source[doc_id][0]) > 50 else "")
                 try:
-                    entities, record = future.result()
+                    missed, record = future.result()
                     reviewer_records.append(record)
-                    for ent in entities:
-                        reviewer_entities.append({
+                    for m in missed:
+                        missed_entities.append({
                             "doc_id": doc_id,
-                            "entity": ent.entity,
-                            "mapped_from": ent.mapped_from,
-                            "entity_sentiment": ent.entity_sentiment,
-                            "impact_level": ent.impact_level,
-                            "sentiment_reason": ent.sentiment_reason,
-                            "risk_type": "，".join(ent.risk_type),
+                            "entity": m["entity"],
+                            "reason": m.get("reason", ""),
                         })
                     if record.entities_count > 0:
-                        names = [e.entity for e in entities]
-                        print(f"  [review] [{done_count:>3}/{total}] found {record.entities_count}: {names}")
+                        names = [m["entity"] for m in missed]
+                        print(f"  [review] [{done_count:>3}/{total}] found {record.entities_count} missed: {names}")
                     else:
                         print(f"  [review] [{done_count:>3}/{total}] none | {snippet}")
                 except Exception as e:
                     print(f"  [review] [{done_count:>3}/{total}] err: {e} | {snippet}")
 
-        reviewer_entities, review_filtered = _filter_entity_rows(reviewer_entities)
-        all_entities = _dedup_reviewer_entities(all_entities, reviewer_entities)
-        reviewer_recovered = len(all_entities) - n_before_review
-        reviewer_recovered_articles = {r["doc_id"] for r in all_entities[n_before_review:]}
-        print(f"  Reviewer recovered {reviewer_recovered} entities "
-              f"({len(reviewer_recovered_articles)} articles), "
-              f"{len(review_filtered)} filtered by post-processing")
         records.extend(reviewer_records)
+
+        if args.infill:
+            n_missed = len(missed_entities)
+            print(f"\n--- Infill stage: filling {n_missed} missed entities ---")
+            infiller_agent = InfillerAgent(model=args.model, base_url=args.base_url)
+            infill_entities: list[dict] = []
+
+            missed_by_doc: dict[str, list[dict]] = {}
+            for m in missed_entities:
+                missed_by_doc.setdefault(m["doc_id"], []).append(m)
+
+            with ThreadPoolExecutor(max_workers=min(4, args.workers)) as pool:
+                meta = {}
+                for doc_id, doc_missed in missed_by_doc.items():
+                    names = [m["entity"] for m in doc_missed]
+                    headline, content = source[doc_id]
+                    future = pool.submit(
+                        infiller_agent.infill_batch, doc_id, headline, content, names,
+                    )
+                    meta[future] = (doc_id, names)
+
+                done_count = 0
+                total = len(meta)
+                infill_records: list = []
+                for future in as_completed(meta):
+                    doc_id, names = meta[future]
+                    done_count += 1
+                    try:
+                        entities, record = future.result()
+                        infill_records.append(record)
+                        for ent in entities:
+                            infill_entities.append({
+                                "doc_id": doc_id,
+                                "entity": ent.entity,
+                                "mapped_from": ent.mapped_from,
+                                "entity_sentiment": ent.entity_sentiment,
+                                "impact_level": ent.impact_level,
+                                "sentiment_reason": ent.sentiment_reason,
+                                "risk_type": "，".join(ent.risk_type),
+                            })
+                        if record.entities_count > 0:
+                            filled_names = [e.entity for e in entities]
+                            print(f"  [infill] [{done_count:>3}/{total}] {doc_id[:16]} filled {record.entities_count}/{len(names)}: {filled_names}")
+                        else:
+                            print(f"  [infill] [{done_count:>3}/{total}] {doc_id[:16]} none filled (of {len(names)})")
+                    except Exception as e:
+                        print(f"  [infill] [{done_count:>3}/{total}] {doc_id[:16]} err: {e}")
+
+            infill_entities, review_filtered = _filter_entity_rows(infill_entities)
+            all_entities = _dedup_reviewer_entities(all_entities, infill_entities)
+            reviewer_recovered = len(all_entities) - n_before_review
+            reviewer_recovered_articles = {r["doc_id"] for r in all_entities[n_before_review:]}
+            print(f"  Infill recovered {reviewer_recovered} entities "
+                  f"({len(reviewer_recovered_articles)} articles), "
+                  f"{len(review_filtered)} filtered by post-processing")
+            records.extend(infill_records)
+        else:
+            # --review only: diagnostic output, no infill
+            print(f"  Review found {len(missed_entities)} missed entities total. "
+                  f"Use --infill to fill entity fields.")
+
         wall_clock = time.time() - t_start
 
     raw_lines = _build_raw_lines(list(source.keys()), all_entities)
@@ -571,8 +618,9 @@ def main(args):
     print(f"Entities extracted: {summary['total_entities']}")
     if args.retry_empty and retry_empty_recovered:
         print(f"Retry-empty recovered {retry_empty_recovered} entities from {retry_empty_articles} articles")
-    if args.review and reviewer_recovered:
-        print(f"Reviewer ({args.review}) recovered {reviewer_recovered} entities from {len(reviewer_recovered_articles)} articles")
+    if (args.review or args.infill) and reviewer_recovered:
+        mode = "Infill" if args.infill else f"Reviewer ({args.review})"
+        print(f"{mode} recovered {reviewer_recovered} entities from {len(reviewer_recovered_articles)} articles")
     print(f"Output formats: {', '.join(summary['config']['output_formats'])}")
     print(f"Output: {args.output}/")
 

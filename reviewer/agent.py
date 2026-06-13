@@ -10,86 +10,79 @@ from openai import OpenAI
 
 load_dotenv()
 
-REVIEWER_PROMPT = """你是一个金融舆情遗漏审查员。给定一篇新闻文章和系统已抽取的商业实体列表，找出被遗漏的商业实体。
+REVIEWER_PROMPT = """你是一个金融舆情评测专家。检查系统提取的商业实体是否完整、是否有多余，
+以及情感方向和风险分类是否准确。
 
-## 任务要求
-- 找出原文中存在具体事件、数据、公告、交易、经营动作、产品进展、投诉、处罚、合作、融资、业绩变化等实质性信息的商业实体。
-- 产品/品牌有明确母公司的，输出母公司，用 mapped_from 记录产品名。
-- 同一实体有多个遗漏理由的合并为一行。
-- 不要把系统已抽取的实体再输出。
+## 任务边界
+- 同时检查遗漏（missed）和多余（extra）。
+- extra 只能从系统已提取的 entity 中选择。
+- missed 只包括文章中有具体事件、数据、公告等实质性信息的商业实体。
 
-## 明确不输出（以下情况即使文章提到了，也不算遗漏，不应输出）
+## 有效实体
+- 公司、金融机构、商业机构、商业品牌，只要有具体事件、数据、公告、交易、
+  经营动作、产品进展、投诉、处罚、合作、融资、业绩变化等实质性信息。
+- 产品/品牌有明确母公司的，母公司是有效实体。
+- "中性"也必须有具体事件但正负不明确；仅提及不是中性。
+
+## 应判 extra
 - 个人姓名、政府机关、监管机构、事业单位、媒体、数据来源、发布平台。
 - 指数、板块、商品、原材料、币种、代币、概念符号。
+- 没有自身新事件或影响的：名单/案例实体、对比对象、泛泛客户/供应商、竞品背景。
+- sentiment_reason 已写明"仅提及/无具体事件/只是背景/作为对比"的实体。
+
+## 不应列为 missed（以下情况即使文章提到了，也不算遗漏）
 - ETF 成分股/持仓股：文章提及某 ETF 时列举的成分股。
 - 纯股价涨跌：没有附带具体事件或业务信息的股价变动。
 - 名单/排名：被列为某榜单、共同持有标的、客户名单的实体。
 - 行业背景/竞品：作为行业背景、市场规模信息出现的其他公司。
 - 观点/传闻：个人观点、市场传闻、未正式官宣的信息。
 - 非商业主体：基金产品名称、项目名称、活动名称。
-- 映射后的名称：原文提及的产品/品牌名如果已通过 mapped_from 输出，不属于遗漏。
-- 常规治理事项：董事会决议、监事会决议、股东会通知、人事变更、投资者交流等公司例行事务。
-- 系统已抽取的实体。
+- 映射后的名称：原文提及的产品/品牌名如果被系统提取为 mapped_from
+  字段的值，且对应 entity 已被提取，不属于遗漏。
+- 常规治理事项：董事会决议、监事会决议、股东会通知、人事变更、
+  投资者交流等公司例行事务，不构成"具体事件"。
+
 
 ## JSON 输出格式
-[
-  {
-    "entity": "商业实体名称",
-    "mapped_from": "产品/品牌名（多个用逗号分隔，无则留空）",
-    "entity_sentiment": "利好 / 中性 / 利空",
-    "impact_level": "大 / 中 / 小（仅在利空时填写，中性或利好时留空）",
-    "sentiment_reason": "遗漏理由（简要说明为什么该实体应被抽取）",
-    "risk_type": "利空时填写风险类别，多个用逗号分隔，可选值：产品质量、财务风险、监管合规、经营风险、竞争风险、品牌声誉；中性/利好时留空"
-  }
-]
-无遗漏时返回空列表 []。
-
-## 影响程度分级
-- 大：事件对公司整体产生重大冲击，如破产、并购、重大处罚、业绩暴雷、大规模停产、工厂事故
-- 中：事件有可量化影响但不致命，如新产品发布、中标项目、常规诉讼、产线投产
-- 小：事件对公司整体影响有限，如边缘业务调整、小额投资、局部产品问题、轻微舆情
-
-## 风险类别说明（仅 entity_sentiment 为"利空"时填写）
-- 产品质量：产品召回、事故、质量问题、食品安全、不合格
-- 财务风险：亏损、减值、债务违约、资金链断裂、业绩下滑
-- 监管合规：处罚、诉讼、监管问询、立案、整改通知
-- 经营风险：停产、裁员、关店、供应链中断、产能不足
-- 竞争风险：份额下滑、被竞品超越、客户流失
-- 品牌声誉：负面舆情、丑闻、公关危机
+{
+  "missed": [{"entity": "实体名称", "reason": "遗漏原因"}],
+  "extra": [{"entity": "实体名称", "reason": "多余原因"}],
+}
+无对应问题时对应列表为空 []。
 
 ## 示例
 
-例1：投资方被遗漏
-标题：曦智科技登陆港交所，多家机构参与投资
-正文：全球首家光电混合算力企业曦智科技今日在港交所挂牌上市，上市首日股价大涨88%。公司本轮融资得到了真格基金、百度、五源资本等多家投资机构的支持，募资总额超过20亿港元。
-系统已抽取：
-[{"entity": "曦智科技", "entity_sentiment": "利好", "sentiment_reason": "全球首家光电混合算力企业登陆港交所，上市首日股价大涨88%"}]
+例1：个人姓名不应输出
+标题：苹果与宁德时代洽谈电池供应合作
+正文：据知情人士透露，苹果正在与宁德时代就电动汽车电池供应进行初步洽谈。
+宁德时代董事长曾毓群未对此置评。
+系统提取：
+[{"entity": "曾毓群", "entity_sentiment": "中性", "sentiment_reason": "董事长被提及"},
+ {"entity": "宁德时代", "entity_sentiment": "中性", "sentiment_reason": "与苹果洽谈电池供应"}]
 输出：
-[{"entity": "真格基金", "mapped_from": "", "entity_sentiment": "中性", "impact_level": "", "sentiment_reason": "作为曦智科技的投资方被提及，有具体投资事件", "risk_type": ""},
- {"entity": "百度", "mapped_from": "", "entity_sentiment": "中性", "impact_level": "", "sentiment_reason": "作为曦智科技的投资方被提及，有具体投资事件", "risk_type": ""},
- {"entity": "五源资本", "mapped_from": "", "entity_sentiment": "中性", "impact_level": "", "sentiment_reason": "作为曦智科技的投资方被提及，有具体投资事件", "risk_type": ""}]
+{"missed": [], "extra": [{"entity": "曾毓群", "reason": "个人姓名，非商业实体"}]}
 
-例2：纯股价涨跌不应输出
+例2：ETF成分股不应列为 missed
+标题：芯片ETF（159995）高开震荡，半导体板块走强
+正文：芯片ETF今日高开震荡，成分股圣邦股份涨超10%，龙芯中科涨6.91%。
+系统提取：[]
+输出：
+{"missed": [], "extra": []}
+
+例3：纯股价涨跌不应列为 missed
 标题：科技股全线大涨，恒生科技指数涨超4%
 正文：今日港股科技股大涨，中国联通涨超11%，阿里巴巴涨超11%，哔哩哔哩涨超10%。
-系统已抽取：[]
-输出：[]
+系统提取：[]
+输出：
+{"missed": [], "extra": []}
 
-例3：名单/对比对象不应输出
+例4：名单/对比对象不应列为 missed
 标题：高盛列出对冲基金共同偏爱的股票
 正文：高盛最新报告显示，对冲基金与共同基金偏爱的股票包括AppLovin、万事达、Spotify等。
-系统已抽取：[]
-输出：[]"""
-
-
-@dataclass
-class EntityEvalResult:
-    entity: str
-    mapped_from: str = ""
-    entity_sentiment: str = "中性"
-    impact_level: str = ""
-    sentiment_reason: str = ""
-    risk_type: list[str] = field(default_factory=list)
+系统提取：[]
+输出：
+{"missed": [], "extra": []}
+"""  # noqa: E501
 
 
 @dataclass
@@ -148,16 +141,16 @@ class ReviewerAgent:
                 raw = response.choices[0].message.content
                 usage = response.usage
 
-                entities = self._parse_response(raw)
+                missed = self._parse_response(raw)
                 record = CallRecord(
                     doc_id=doc_id,
                     success=True,
                     duration_seconds=round(elapsed, 2),
                     prompt_tokens=getattr(usage, "prompt_tokens", 0),
                     completion_tokens=getattr(usage, "completion_tokens", 0),
-                    entities_count=len(entities),
+                    entities_count=len(missed),
                 )
-                return entities, record
+                return missed, record
 
             except ValueError as e:
                 detail = f"\nraw: {raw}" if raw else ""
@@ -174,35 +167,22 @@ class ReviewerAgent:
 
         raise last_err or RuntimeError("max retries exceeded")
 
-    def _parse_response(self, raw: str) -> list[EntityEvalResult]:
+    def _parse_response(self, raw: str) -> list[dict]:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
             raise ValueError(f"Reviewer returned invalid JSON: {e}") from e
 
-        if isinstance(data, list):
-            raw_entities = data
-        elif isinstance(data, dict):
-            raw_entities = data.get("entities", data.get("missed", []))
-        else:
-            raise ValueError(f"unexpected JSON structure: {type(data).__name__}")
-
-        if not isinstance(raw_entities, list):
-            raise ValueError(f"entities field is not a list: {type(raw_entities).__name__}")
+        missed = data.get("missed", [])
+        if not isinstance(missed, list):
+            raise ValueError(f"missed field is not a list: {type(missed).__name__}\nraw: {raw}")
 
         results = []
-        for i, item in enumerate(raw_entities):
+        for i, item in enumerate(missed):
             if not isinstance(item, dict):
-                raise ValueError(f"entity {i} is not a dict: {type(item).__name__}")
-            raw_risk = item.get("risk_type", [])
-            if isinstance(raw_risk, str):
-                raw_risk = [raw_risk] if raw_risk else []
-            results.append(EntityEvalResult(
-                entity=item.get("entity", ""),
-                mapped_from=item.get("mapped_from", ""),
-                entity_sentiment=item.get("entity_sentiment", "中性"),
-                impact_level=item.get("impact_level", ""),
-                sentiment_reason=item.get("sentiment_reason", ""),
-                risk_type=raw_risk,
-            ))
+                raise ValueError(f"missed item {i} is not a dict: {type(item).__name__}")
+            results.append({
+                "entity": item.get("entity", ""),
+                "reason": item.get("reason", ""),
+            })
         return results

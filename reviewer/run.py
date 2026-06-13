@@ -9,24 +9,14 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from entity_eval.run import (
-    ENTITY_COLUMNS,
-    _build_raw_lines,
-    _dedup_reviewer_entities,
-    _filter_entity_rows,
-    _merge_entity_rows,
-)
+from entity_eval.run import _filter_entity_rows
 from reviewer.agent import ReviewerAgent
 
 
 REVIEWER_COLUMNS = [
     "doc_id",
     "entity",
-    "mapped_from",
-    "entity_sentiment",
-    "impact_level",
-    "sentiment_reason",
-    "risk_type",
+    "reason",
 ]
 
 
@@ -108,20 +98,16 @@ def main(args):
             headline = (source_df.loc[doc_id, "headline"] if doc_id in source_df.index else "") or ""
             snippet = headline[:50]
             try:
-                entities, record = future.result()
+                missed, record = future.result()
                 records.append(record)
-                for ent in entities:
+                for m in missed:
                     all_missed.append({
                         "doc_id": doc_id,
-                        "entity": ent.entity,
-                        "mapped_from": ent.mapped_from,
-                        "entity_sentiment": ent.entity_sentiment,
-                        "impact_level": ent.impact_level,
-                        "sentiment_reason": ent.sentiment_reason,
-                        "risk_type": "，".join(ent.risk_type),
+                        "entity": m["entity"],
+                        "reason": m.get("reason", ""),
                     })
                 if record.entities_count > 0:
-                    names = [e.entity for e in entities]
+                    names = [m["entity"] for m in missed]
                     print(f"[{done:>3}/{total}] found {record.entities_count} missed: {names}")
                 else:
                     print(f"[{done:>3}/{total}] none | {snippet}")
@@ -135,20 +121,8 @@ def main(args):
     print(f"\nReviewer found {len(all_missed)} missed entities ({len(review_filtered)} filtered).")
 
     if args.merge:
-        orig_rows = original_df.fillna("").to_dict("records")
-        merged = _dedup_reviewer_entities(orig_rows, all_missed)
-        merged = _merge_entity_rows(merged)
-        merged_df = pd.DataFrame(merged, columns=ENTITY_COLUMNS)
-
-        merged_df.to_csv(f"{args.output}/entities.csv", index=False, encoding="utf-8-sig")
-        raw_lines = _build_raw_lines(all_doc_ids, merged)
-        with open(f"{args.output}/entities.jsonl", "w", encoding="utf-8") as f:
-            for line in raw_lines:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
-
-        gained = len(merged) - len(orig_rows)
-        print(f"Merged: {len(orig_rows)} original + {gained} new = {len(merged)} total entities.")
-        print(f"Overwrote {args.output}/entities.csv, entities.jsonl")
+        print(f"  Note: reviewer now outputs only entity names. "
+              f"Use `entity_eval.run --infill` for full three-stage pipeline.")
 
 
 if __name__ == "__main__":
